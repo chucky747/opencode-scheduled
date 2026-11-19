@@ -1,0 +1,42 @@
+{
+  "name": "opencode-scheduled",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Scheduled tasks for OpenCode Desktop: cron and interval jobs with per-task chats, model selection, and manual runs.",
+  "license": "MIT",
+  "author": "chucky747",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/chucky747/opencode-scheduled.git"
+  },
+  "bugs": {
+    "url": "https://github.com/chucky747/opencode-scheduled/issues"
+  },
+  "homepage": "https://github.com/chucky747/opencode-scheduled#readme",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "scheduled",
+    "cron",
+    "automation"
+  ],
+  "scripts": {
+    "build": "vite build",
+    "typecheck": "tsc --noEmit"
+  },
+  "exports": {
+    "./gui-experimental": "./dist/gui-experimental.cjs"
+  },
+  "dependencies": {
+    "@opencode/client": "2.3.2",
+    "@opencode/plugin": "2.3.2",
+    "effect": "4.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "solid-js": "^1.9.17",
+    "typescript": "^7.0.2",
+    "vite": "^7.3.7",
+    "vite-plugin-solid": "^2.11.10"
+  }
+}
