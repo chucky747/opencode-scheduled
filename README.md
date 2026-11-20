@@ -19,12 +19,19 @@ does not patch `app.asar`.
   model.
 - **Run task** starts the prompt immediately and shows the host loader while the
   chat is busy.
+- **Copy prompt** confirms with a check icon and a **Copied** label. The prompt
+  block is the app's own read-only code block, with its copy button.
+- Task names are unique within a project. Creating a task with an existing name
+  is blocked and offers a shortcut to the existing task; scheduling the same
+  prompt in the same chat is blocked too.
+- New tasks take a name from the prompt's first line until you edit the name, so
+  repeated scheduling of the same prompt cannot silently create identical tasks.
 - Pause, resume, duplicate, edit-as-recreate, and delete. Deleting a task also
   removes the chat session it owns, after a confirmation that names the chat.
-- Unread badge, recent-run history, last output, and the running task name in the
-  panel header.
-- Theme-native controls: host buttons, selects, text inputs, loaders, and
-  `--v2-*` color tokens, so light and dark themes apply.
+- Unread badge, recent-run history, last output, and an accurate running/due task
+  name in the panel header.
+- Theme-native controls: host buttons, selects, text inputs, loaders, code blocks,
+  and Markdown, plus `--v2-*` color tokens, so light and dark themes apply.
 - A read-only chat preview under the prompt actions, built from the app's session
   message store and host Markdown renderer. **Open chat** opens the full
   interactive chat.
@@ -113,8 +120,9 @@ bun run build
 - The automation schema has no model, reasoning-effort, or worktree field. A new
   task chat is created with the model chosen in the form; later runs use that
   chat's current model.
-- There is no update endpoint. Editing deletes and recreates the job, so its run
-  count resets.
+- There is no update endpoint. Editing creates the replacement first, then removes
+  the old job; if the old job cannot be removed, the replacement is rolled back.
+  Run count still resets.
 - The server exposes only the last run. **Recent runs seen in this app** is a local
   history approximation.
 - The GUI plugin API does not expose the session timeline component. The inline
