@@ -22,10 +22,13 @@
   ],
   "scripts": {
     "build": "vite build",
+    "test": "bun test",
     "typecheck": "tsc --noEmit"
   },
   "exports": {
-    "./gui-experimental": "./dist/gui-experimental.cjs"
+    ".": "./src/index.ts",
+    "./gui-experimental": "./dist/gui-experimental.cjs",
+    "./rpc": "./src/rpc.ts"
   },
   "dependencies": {
     "@opencode/client": "2.3.2",
@@ -33,6 +36,7 @@
     "effect": "4.1.0"
   },
   "devDependencies": {
+    "@types/bun": "^1.4.5",
     "@types/node": "^24.0.0",
     "solid-js": "^1.9.17",
     "typescript": "^7.0.2",

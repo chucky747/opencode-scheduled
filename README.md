@@ -60,7 +60,7 @@ Register it and enable the automation engine in `opencode.json`:
     {
       "package": "./plugins/scheduled",
       "options": {
-        "directory": "C:/Users/you/Scheduled"
+        "directory": "~/Scheduled"
       }
     }
   ],
@@ -70,9 +70,17 @@ Register it and enable the automation engine in `opencode.json`:
 }
 ```
 
-`options.directory` must be an absolute path. Create that folder and register it
-as a project in the app (**Settings → Projects → Add project**); the plugin
-creates sessions there and names the project **Scheduled**.
+`options.directory` accepts a portable path. Use `~/Scheduled`, `~\Scheduled`,
+`%USERPROFILE%\Scheduled`, or `$HOME/Scheduled`; an absolute path also works. A
+leading `~` becomes the server user's home directory, `%NAME%`, `$NAME`, and
+`${NAME}` become environment values (case-insensitive on Windows, unknown
+variables left as written), and the result is resolved and normalized to forward
+slashes. A relative value is resolved from the server's working directory.
+
+The value is expanded by the plugin's server half over plugin RPC, because the
+window half has no home directory or environment of its own. Create the folder
+and register it as a project in the app (**Settings → Projects → Add project**);
+the plugin creates sessions there and names the project **Scheduled**.
 
 Reload OpenCode:
 

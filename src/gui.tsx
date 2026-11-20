@@ -2,6 +2,7 @@ import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount }
 import { Command, Panel, Plugin, Slot, Store, TitlebarItem } from "@opencode/plugin/gui"
 import { Schema } from "effect"
 import type { AutomationInfo } from "@opencode/client/promise"
+import { ScheduledRpc } from "./rpc"
 
 type DialogHandle = { close(): void }
 
@@ -29,6 +30,30 @@ function normalizeDirectory(value: string) {
 
 function setScheduledDirectory(value: string) {
   scheduledDirectory = normalizeDirectory(value.trim())
+}
+
+const absoluteDirectory = /^(?:[A-Za-z]:[\\/]|[\\/])/
+let directoryExpansionWarned = false
+
+// The renderer has no `os.homedir()`, so portable values such as `~/Scheduled`
+// or `%USERPROFILE%\Scheduled` are expanded by the plugin's server half.
+function configureScheduledDirectory(ctx: any, value: string) {
+  const raw = value.trim()
+  setScheduledDirectory(raw)
+  if (!raw || (absoluteDirectory.test(raw) && !/[~%$]/.test(raw))) return
+  void ctx.client
+    .rpc(ScheduledRpc)
+    .expandPath({ path: raw })
+    .then((result: unknown) => {
+      if (ctx.signal?.aborted) return
+      const expanded = (result as { path?: unknown } | undefined)?.path
+      if (typeof expanded === "string" && expanded) setScheduledDirectory(expanded)
+    })
+    .catch((error: unknown) => {
+      if (directoryExpansionWarned) return
+      directoryExpansionWarned = true
+      console.warn("[scheduled] could not expand the directory option; using it as written", error)
+    })
 }
 
 function getScheduledDirectory() {
@@ -2125,7 +2150,7 @@ function ScheduledDialog(props: {
 
 const setup: Plugin.Setup<typeof definition> = (ctx) => {
   const configuredDirectory = (ctx.options as any)?.directory
-  if (typeof configuredDirectory === "string") setScheduledDirectory(configuredDirectory)
+  if (typeof configuredDirectory === "string") configureScheduledDirectory(ctx, configuredDirectory)
   const monitor = createMonitor(ctx)
   let active: DialogHandle | undefined
   const panelKey = `${ctx.id}:main`
