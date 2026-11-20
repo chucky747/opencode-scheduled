@@ -15,11 +15,18 @@ type Row = AutomationInfo & {
 }
 
 type HistoryEntry = { run: number; at: number; outcome: string; output?: string }
-type StoredState = { seen: Record<string, number>; history: Record<string, HistoryEntry[]> }
+type StoredState = {
+  seen: Record<string, number>
+  history: Record<string, HistoryEntry[]>
+  owned: Record<string, string>
+}
+
+type DockedSession = { id: string; server: { id: string } }
 
 type Filter = "all" | "active" | "paused" | "done"
 type FormMode = "new" | "current" | "other" | "child"
 type ScheduleMode = "once" | "every" | "cron"
+type EveryUnit = "minutes" | "hours" | "days"
 type TaskModelOption = { value: string; label: string; id: string; providerID: string; variant?: string }
 
 let scheduledDirectory = ""
@@ -69,17 +76,20 @@ function isScheduledDirectory(directory: string) {
 
 const definition = Plugin.define({
   stores: {
-    state: Store.global(Schema.Struct({ seen: Schema.String, history: Schema.String }), {
-      seen: "{}",
-      history: "{}",
-    }),
+    state: Store.global(
+      Schema.Struct({ seen: Schema.String, history: Schema.String, owned: Schema.String }),
+      {
+        seen: "{}",
+        history: "{}",
+        owned: "{}",
+      },
+    ),
   },
 })
 
 const text = "var(--v2-text-text-base, #e8e8e8)"
 const muted = "var(--v2-text-text-muted, #a0a0a0)"
 const faint = "var(--v2-text-text-faint, #7a7a7a)"
-const borderMuted = "var(--v2-border-border-muted, #333)"
 const border = "var(--v2-border-border-base, #3a3a3a)"
 const focus = "var(--v2-border-border-focus, #4c8dff)"
 const hover = "var(--v2-overlay-simple-overlay-hover, rgba(255,255,255,0.06))"
@@ -96,11 +106,13 @@ const styleSheet = `
 .sched-row:focus-visible { outline: 2px solid ${focus}; outline-offset: -2px; }
 .sched-tab:hover:not([data-active="true"]) { color: ${text}; }
 .sched-tab:focus-visible { outline: 2px solid ${focus}; outline-offset: -2px; border-radius: 4px; }
-.sched-input:focus, .sched-input:focus-visible { outline: none; box-shadow: 0 0 0 1px ${focus}; }
+.sched-input { outline: 1px solid transparent; outline-offset: -1px; }
+.sched-input:focus, .sched-input:focus-visible { outline-color: ${focus}; }
+.sched-input::placeholder { color: ${faint}; }
 .sched-code { border-radius: var(--radius-md, 6px); overflow: auto; }
-.sched-code > * { margin: 0 !important; }
-.sched-copy { min-width: 150px; }
-.sched-search { width: 100%; }
+.sched-code, .sched-code * { margin-block: 0 !important; }
+.sched-code pre, .sched-code code { white-space: pre-wrap !important; overflow-wrap: anywhere !important; word-break: break-word; }
+.sched-field { width: 100%; }
 `
 
 function Styles() {
@@ -110,36 +122,40 @@ function Styles() {
 const inputStyle = {
   width: "100%",
   "box-sizing": "border-box",
-  background: panel,
+  background: base,
   color: text,
-  border: `1px solid ${border}`,
+  border: 0,
   "border-radius": "var(--radius-md, 6px)",
+  "box-shadow": `var(--v2-elevation-input, 0 0 0 0.5px ${border})`,
   padding: "6px 8px",
   "font-size": "13px",
   "font-weight": 440,
-  "line-height": "20px",
-  "min-height": "30px",
-  outline: "none",
+  "line-height": "16px",
+  "font-family": "inherit",
+  "min-height": "28px",
 } as const
 
 function readState(ctx: any): StoredState {
   try {
-    const value = ctx.stores.state.value as { seen?: string; history?: string }
+    const value = ctx.stores.state.value as { seen?: string; history?: string; owned?: string }
     const seen = JSON.parse(value.seen || "{}")
     const history = JSON.parse(value.history || "{}")
+    const owned = JSON.parse(value.owned || "{}")
     return {
       seen: seen && typeof seen === "object" ? seen : {},
       history: history && typeof history === "object" ? history : {},
+      owned: owned && typeof owned === "object" ? owned : {},
     }
   } catch {
-    return { seen: {}, history: {} }
+    return { seen: {}, history: {}, owned: {} }
   }
 }
 
 function writeState(ctx: any, next: StoredState) {
-  ctx.stores.state.update((draft: { seen: string; history: string }) => {
+  ctx.stores.state.update((draft: { seen: string; history: string; owned: string }) => {
     draft.seen = JSON.stringify(next.seen)
     draft.history = JSON.stringify(next.history)
+    draft.owned = JSON.stringify(next.owned)
   })
 }
 
@@ -208,11 +224,43 @@ function cadence(row: Row) {
   return `On ${trigger.server}/${trigger.event}`
 }
 
+type ChatModel = { providerID: string; id: string; variant?: string }
+type ChatInfo = { title?: string; model?: ChatModel }
+
+// Task chats the app has not loaded into its session store yet, keyed `${server}\0${id}`.
+const [fetchedChats, setFetchedChats] = createSignal<Record<string, ChatInfo>>({})
+const chatRequests = new Set<string>()
+
+// A task chat's title and model: from the app's session store when loaded, else from one server read.
+function chatInfo(ctx: any, server: string, id: string): ChatInfo | undefined {
+  const info = ctx.servers.get(server)?.data?.session?.get?.(id)
+  return info ?? fetchedChats()[`${server}\0${id}`]
+}
+
 function chatTitle(ctx: any, server: string, id?: string) {
   if (!id) return "this chat"
-  const ref = ctx.servers.get(server)
-  const info = ref?.data?.session?.get?.(id)
-  return info?.title || id
+  return chatInfo(ctx, server, id)?.title || "Untitled chat"
+}
+
+// The session store only holds chats the app has opened, so ask the server once for the rest.
+function fetchMissingChats(ctx: any, rows: Row[]) {
+  for (const row of rows) {
+    const id = targetSessionID(row)
+    if (!id) continue
+    const key = `${row.server}\0${id}`
+    if (chatRequests.has(key) || chatInfo(ctx, row.server, id)) continue
+    const server = ctx.servers.get(row.server)
+    if (!server) continue
+    chatRequests.add(key)
+    void server.client.session
+      .get({ sessionID: id })
+      .then((result: (ChatInfo & { data?: ChatInfo }) | undefined) => {
+        const info = result?.data ?? result
+        if (info) setFetchedChats((current) => ({ ...current, [key]: { title: info.title, model: info.model } }))
+      })
+      // A chat that cannot be read (deleted, or on a server that dropped) keeps the fallback label.
+      .catch(() => undefined)
+  }
 }
 
 function targetSessionID(row: Row) {
@@ -223,6 +271,11 @@ function targetSessionID(row: Row) {
     return match?.[0]
   }
   return row.sessionID
+}
+
+function belongsToSession(row: Row, session: DockedSession) {
+  if (row.server !== session.server.id) return false
+  return targetSessionID(row) === session.id || row.sessionID === session.id
 }
 
 function destination(ctx: any, row: Row) {
@@ -277,6 +330,7 @@ function createMonitor(ctx: any) {
         return
       }
 
+      const startedAt = Date.now()
       const settled = await Promise.allSettled(
         servers.map(async (server: any) => ({
           server,
@@ -286,12 +340,14 @@ function createMonitor(ctx: any) {
 
       const next: Row[] = []
       const failures: string[] = []
+      const loadedServers = new Set<string>()
       for (const result of settled) {
         if (result.status === "rejected") {
           failures.push(errorMessage(result.reason))
           continue
         }
         const { server, list } = result.value
+        loadedServers.add(server.id)
         for (const row of list) {
           next.push({
             ...row,
@@ -314,6 +370,7 @@ function createMonitor(ctx: any) {
 
       const state = readState(ctx)
       const history = { ...state.history }
+      const owned = { ...state.owned }
       let changed = false
       const newRuns: Array<{ row: Row; entry: HistoryEntry }> = []
 
@@ -339,9 +396,26 @@ function createMonitor(ctx: any) {
         }
       }
 
-      if (changed) writeState(ctx, { seen: state.seen, history })
+      for (const key of Object.keys(owned)) {
+        const separator = key.indexOf("\0")
+        if (separator < 0) {
+          delete owned[key]
+          changed = true
+          continue
+        }
+        if (!loadedServers.has(key.slice(0, separator))) continue
+        // A list request that started before the task was created cannot know about it yet.
+        if ((ownedMarkedAt.get(key) ?? 0) >= startedAt) continue
+        if (!next.some((row) => row.key === key)) {
+          delete owned[key]
+          changed = true
+        }
+      }
+
+      if (changed) writeState(ctx, { seen: state.seen, history, owned })
 
       setRows(next)
+      fetchMissingChats(ctx, next)
       setLoading(false)
       setError(failures.length && next.length === 0 ? failures[0] : undefined)
       setUnread(
@@ -379,9 +453,26 @@ function createMonitor(ctx: any) {
       }
     }
     if (changed) {
-      writeState(ctx, { seen: state.seen, history: state.history })
+      writeState(ctx, state)
       setUnread(rows().filter((row) => row.lastRunAt && row.lastRunAt > (state.seen[row.id] ?? 0)).length)
     }
+  }
+
+  const ownedMarkedAt = new Map<string, number>()
+  const markOwned = (key: string, sessionID: string) => {
+    const state = readState(ctx)
+    state.owned[key] = sessionID
+    ownedMarkedAt.set(key, Date.now())
+    writeState(ctx, state)
+  }
+
+  const ownsChat = (row: Row) => {
+    const target = targetSessionID(row)
+    if (!target) return false
+    if (readState(ctx).owned[row.key] === target) return true
+    if (!isScheduledDirectory(row.directory)) return false
+    if (target !== row.sessionID) return false
+    return chatTitle(ctx, row.server, target).trim() === row.name.trim()
   }
 
   const sessionInfo = (row: Row) => {
@@ -432,7 +523,7 @@ function createMonitor(ctx: any) {
     if (runTimer) clearInterval(runTimer)
   })
 
-  return { rows, loading, error, unread, running, runningRows, dueRows, activity, runningLabel, refresh: load, markSeen, history, seenAt }
+  return { rows, loading, error, unread, running, runningRows, dueRows, activity, runningLabel, refresh: load, markSeen, markOwned, ownsChat, history, seenAt }
 }
 
 type Monitor = ReturnType<typeof createMonitor>
@@ -452,34 +543,162 @@ function Dot(props: { color: string; size?: number }) {
   )
 }
 
-function FilterButton(props: { active: boolean; label: string; count: number; onClick: () => void }) {
+type Tab = { id: string; label: string; count?: number }
+
+function TabStrip(props: { tabs: Tab[]; active: string; onChange: (id: string) => void; end?: any }) {
   return (
-    <button
-      type="button"
-      class="sched-tab"
-      data-active={props.active}
-      aria-pressed={props.active}
-      onClick={props.onClick}
+    <div
+      role="tablist"
       style={{
-        height: "100%",
-        padding: "6px",
-        border: "none",
-        "border-bottom": `1px solid ${props.active ? faint : "transparent"}`,
-        background: "transparent",
-        color: props.active ? text : muted,
-        "font-size": "13px",
-        "font-weight": 440,
-        "letter-spacing": "-0.04px",
-        "font-variant-numeric": "tabular-nums",
-        cursor: "default",
-        display: "inline-flex",
+        display: "flex",
         "align-items": "center",
         gap: "6px",
+        height: "32px",
+        padding: "0 8px",
+        "border-bottom": `1px solid ${border}`,
+        "flex-shrink": 0,
+        overflow: "hidden",
       }}
     >
-      <span>{props.label}</span>
-      <span style={{ color: faint, "font-size": "11px", "font-weight": 440 }}>{props.count}</span>
-    </button>
+      <For each={props.tabs}>
+        {(tab) => {
+          const active = () => props.active === tab.id
+          return (
+            <button
+              type="button"
+              role="tab"
+              aria-selected={active()}
+              class="sched-tab"
+              data-active={active()}
+              onClick={() => props.onChange(tab.id)}
+              style={{
+                height: "100%",
+                padding: "6px",
+                border: "none",
+                "border-bottom": `1px solid ${active() ? faint : "transparent"}`,
+                background: "transparent",
+                color: active() ? text : muted,
+                "font-size": "13px",
+                "font-weight": 440,
+                "letter-spacing": "-0.04px",
+                "font-variant-numeric": "tabular-nums",
+                display: "inline-flex",
+                "align-items": "center",
+                gap: "6px",
+              }}
+            >
+              <span>{tab.label}</span>
+              <Show when={tab.count !== undefined}>
+                <span style={{ color: faint, "font-size": "11px", "font-weight": 440 }}>{tab.count}</span>
+              </Show>
+            </button>
+          )
+        }}
+      </For>
+      <div style={{ flex: 1 }} />
+      {props.end}
+    </div>
+  )
+}
+
+function HeaderBar(props: { children: any }) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        "align-items": "center",
+        gap: "8px",
+        padding: "10px 12px",
+        "border-bottom": `1px solid ${border}`,
+        "flex-shrink": 0,
+        "min-height": "44px",
+        "box-sizing": "border-box",
+      }}
+    >
+      {props.children}
+    </div>
+  )
+}
+
+function KeyValueRow(props: { label: string; children: any; last?: boolean }) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        "align-items": "baseline",
+        gap: "16px",
+        padding: "8px 0",
+        "border-bottom": props.last ? undefined : `0.5px solid ${border}`,
+        "min-width": 0,
+      }}
+    >
+      <span style={{ color: muted, "font-size": "13px", "font-weight": 440, "flex-shrink": 0 }}>{props.label}</span>
+      <span
+        style={{
+          color: text,
+          "font-size": "13px",
+          "font-weight": 440,
+          "line-height": "20px",
+          "text-align": "right",
+          "margin-left": "auto",
+          "min-width": 0,
+          "overflow-wrap": "anywhere",
+        }}
+      >
+        {props.children}
+      </span>
+    </div>
+  )
+}
+
+function EmptyState(props: { title: string; description: string; children?: any }) {
+  return (
+    <div
+      style={{
+        flex: 1,
+        display: "flex",
+        "flex-direction": "column",
+        "align-items": "center",
+        "justify-content": "center",
+        gap: "8px",
+        padding: "32px 16px",
+        "text-align": "center",
+      }}
+    >
+      <div style={{ color: text, "font-size": "13px", "font-weight": 530, "letter-spacing": "-0.04px" }}>
+        {props.title}
+      </div>
+      <div style={{ color: muted, "font-size": "13px", "font-weight": 440, "line-height": "20px", "max-width": "300px" }}>
+        {props.description}
+      </div>
+      {props.children}
+    </div>
+  )
+}
+
+function ErrorNotice(props: { ctx: any; children: any }) {
+  return (
+    <div
+      style={{
+        display: "flex",
+        "align-items": "flex-start",
+        gap: "8px",
+        color: danger,
+        "font-size": "13px",
+        "font-weight": 440,
+        "line-height": "20px",
+        background: `color-mix(in srgb, ${danger} 8%, transparent)`,
+        border: `0.5px solid ${danger}`,
+        "border-radius": "var(--radius-md, 6px)",
+        padding: "8px 10px",
+        "min-width": 0,
+      }}
+    >
+      <span style={{ "flex-shrink": 0, "margin-top": "2px" }}>
+        <props.ctx.ui.Icon name="circle-exclamation" size="small" />
+      </span>
+      <div style={{ "min-width": 0, "overflow-wrap": "anywhere" }}>{props.children}</div>
+    </div>
   )
 }
 
@@ -501,9 +720,8 @@ function RowButton(props: { ctx: any; row: Row; selected: boolean; unread: boole
         "text-align": "left",
         border: "none",
         background: props.selected ? panel2 : "transparent",
-        "border-radius": "var(--radius-sm, 4px)",
-        padding: "8px 10px",
-        cursor: "default",
+        "border-radius": "var(--radius-md, 6px)",
+        padding: "8px 6px",
         display: "flex",
         "flex-direction": "column",
         gap: "3px",
@@ -531,25 +749,6 @@ function RowButton(props: { ctx: any; row: Row; selected: boolean; unread: boole
   )
 }
 
-function Section(props: { title: string; children: any; wide?: boolean; meta?: boolean }) {
-  return (
-    <div style={{ display: "flex", "flex-direction": "column", gap: props.meta ? "3px" : "7px", "min-width": 0, "grid-column": props.wide ? "1 / -1" : undefined }}>
-      <div
-        style={{
-          color: props.meta ? muted : text,
-          "font-size": props.meta ? "11px" : "13px",
-          "font-weight": props.meta ? 440 : 530,
-          "letter-spacing": props.meta ? "0.05px" : "-0.04px",
-          "line-height": props.meta ? "1.2" : "16px",
-        }}
-      >
-        {props.title}
-      </div>
-      <div style={{ color: text, "font-size": "13px", "font-weight": 440, "line-height": "20px", "overflow-wrap": "anywhere" }}>{props.children}</div>
-    </div>
-  )
-}
-
 type ChatEntry =
   | { kind: "user"; text: string }
   | { kind: "assistant"; text: string }
@@ -574,7 +773,7 @@ function toChatEntries(messages: any[]): ChatEntry[] {
   return entries
 }
 
-function SessionChat(props: { ctx: any; messages: any[]; loading: boolean; running: boolean; error?: string }) {
+function SessionChat(props: { ctx: any; messages: any[]; loading: boolean; running: boolean; error?: string; fill?: boolean }) {
   const entries = createMemo(() => toChatEntries(props.messages))
   let box: HTMLDivElement | undefined
 
@@ -595,12 +794,12 @@ function SessionChat(props: { ctx: any; messages: any[]; loading: boolean; runni
         display: "flex",
         "flex-direction": "column",
         gap: "14px",
-        "min-height": "80px",
-        "max-height": "420px",
+        "min-height": props.fill ? "0" : "80px",
+        ...(props.fill ? { flex: 1 } : { "max-height": "420px" }),
         "overflow-y": "auto",
         padding: "2px",
-        "font-size": "var(--font-size-base, 14px)",
-        "line-height": "var(--line-height-large, 1.5)",
+        "font-size": "13px",
+        "line-height": "20px",
       }}
     >
       <Show when={props.error}>
@@ -612,7 +811,7 @@ function SessionChat(props: { ctx: any; messages: any[]; loading: boolean; runni
         </div>
       </Show>
       <Show when={!props.loading && !props.error && entries().length === 0}>
-        <div style={{ color: faint, "font-size": "var(--font-size-small, 13px)" }}>No messages yet.</div>
+        <EmptyState title="No messages yet" description="Messages appear here when the task runs." />
       </Show>
       <For each={entries()}>
         {(entry) => (
@@ -668,7 +867,6 @@ function Detail(props: {
   monitor: Monitor
   row: Row
   dialog?: DialogHandle
-  compact?: boolean
   onBack?: () => void
   onEdit: () => void
   onDuplicate: () => void
@@ -677,11 +875,7 @@ function Detail(props: {
   const [runRequestedAt, setRunRequestedAt] = createSignal(0)
   const [chatLoading, setChatLoading] = createSignal(true)
   const [chatError, setChatError] = createSignal<string | undefined>()
-  const [copied, setCopied] = createSignal(false)
-  let copyTimer: ReturnType<typeof setTimeout> | undefined
-  onCleanup(() => {
-    if (copyTimer) clearTimeout(copyTimer)
-  })
+  const [tab, setTab] = createSignal(targetSessionID(props.row) ? "chat" : "details")
   const chatMessages = () => {
     const sessionID = target()
     const server = props.ctx.servers.get(props.row.server)
@@ -698,7 +892,7 @@ function Detail(props: {
   const modelLabel = () => {
     const sessionID = target()
     if (!sessionID) return "—"
-    const model = props.ctx.servers.get(props.row.server)?.data?.session?.get?.(sessionID)?.model
+    const model = chatInfo(props.ctx, props.row.server, sessionID)?.model
     if (!model) return "—"
     return `${model.providerID}/${model.id}${model.variant ? ` · ${model.variant}` : ""}`
   }
@@ -726,21 +920,23 @@ function Detail(props: {
     }
   }
 
-  const copyPrompt = async () => {
-    if (props.row.action.type !== "prompt") return
-    try {
-      await props.ctx.system.copy(props.row.action.prompt)
-      setCopied(true)
-      if (copyTimer) clearTimeout(copyTimer)
-      copyTimer = setTimeout(() => setCopied(false), 2_000)
-    } catch (error) {
-      props.ctx.toast.show({
-        variant: "error",
-        title: "Could not copy the prompt",
-        description: errorMessage(error),
-      })
-    }
+  const summary = () => {
+    const parts = [cadence(props.row), props.row.tz]
+    if (props.row.status === "active" && props.row.nextDueAt) parts.push(`Next ${relative(props.row.nextDueAt)}`)
+    if (props.row.multiServer) parts.push(props.row.serverLabel)
+    return parts.join(" · ")
   }
+
+  const hasChat = () => !!target()
+  const tabs = (): Tab[] => [
+    ...(hasChat() ? [{ id: "chat", label: "Chat" }] : []),
+    { id: "details", label: "Details" },
+    { id: "runs", label: "Runs" },
+  ]
+
+  createEffect(() => {
+    if (!hasChat() && tab() === "chat") setTab("details")
+  })
 
   const toggle = () =>
     run(async () => {
@@ -755,6 +951,7 @@ function Detail(props: {
 
   const remove = async () => {
     const sessionID = target()
+    const owned = props.monitor.ownsChat(props.row)
     const shared = !!sessionID && props.monitor.rows().some(
       (row) =>
         row.key !== props.row.key &&
@@ -763,11 +960,13 @@ function Detail(props: {
     )
     const ok = await props.ctx.dialogs.confirm({
       title: "Delete scheduled task?",
-      description: sessionID
-        ? shared
+      description: !sessionID
+        ? `“${props.row.name}” will stop and be removed.`
+        : owned && shared
           ? `“${props.row.name}” will stop and be removed. Its chat stays because another task uses it.`
-          : `“${props.row.name}” will stop and be removed, together with its chat and messages.`
-        : `“${props.row.name}” will stop and be removed.`,
+          : owned
+            ? `“${props.row.name}” will stop and be removed, together with its chat and messages.`
+            : `“${props.row.name}” will stop and be removed. Its chat stays: the task was added to an existing chat.`,
       confirm: "Delete",
       danger: true,
     })
@@ -776,11 +975,11 @@ function Detail(props: {
       const server = props.ctx.servers.get(props.row.server)
       if (!server) throw new Error("Server is no longer connected")
       await server.client.experimental.automation.delete({ automationID: props.row.id })
-      if (sessionID && !shared) {
-        const tab = props.ctx.tabs
+      if (owned && !shared && sessionID) {
+        const openTab = props.ctx.tabs
           .list()
           .find((item: any) => item.session?.id === sessionID && item.session?.server?.id === props.row.server)
-        if (tab) props.ctx.tabs.close(tab.key)
+        if (openTab) props.ctx.tabs.close(openTab.key)
         try {
           await server.client.session.remove({ sessionID })
         } catch (error) {
@@ -790,11 +989,13 @@ function Detail(props: {
       props.ctx.toast.show({
         variant: "success",
         title: "Scheduled task deleted",
-        description: sessionID
-          ? shared
+        description: !sessionID
+          ? "The task was removed."
+          : owned && shared
             ? "The task was removed. Its chat is still used by another task."
-            : "The task and its chat were removed."
-          : "The task was removed.",
+            : owned
+              ? "The task and its chat were removed."
+              : "The task was removed. Its chat was kept.",
       })
     })
   }
@@ -850,165 +1051,196 @@ function Detail(props: {
     props.ctx.tabs.open({ server: props.row.server, id }, { focus: true })
   }
 
-  return (
-    <div style={{ display: "flex", "flex-direction": "column", gap: "16px" }}>
-      <Show when={props.onBack}>
-        <div>
-          <props.ctx.ui.Button size="small" variant="ghost-muted" icon="arrow-left" onClick={props.onBack}>
-            Back
-          </props.ctx.ui.Button>
-        </div>
+  const detailsPane = () => (
+    <>
+      <KeyValueRow label="Next run">
+        {props.row.nextDueAt ? `${dateTime(props.row.nextDueAt)} · ${relative(props.row.nextDueAt)}` : "—"}
+      </KeyValueRow>
+      <KeyValueRow label="Last run">
+        {props.row.lastRunAt ? `${dateTime(props.row.lastRunAt)} · ${relative(props.row.lastRunAt)}` : "—"}
+        <Show when={props.row.lastOutcome}>
+          <span style={{ color: props.row.lastOutcome === "failed" ? danger : undefined }}>
+            {" "}
+            · {outcomeLabel(props.row.lastOutcome)}
+          </span>
+        </Show>
+      </KeyValueRow>
+      <KeyValueRow label="Runs">{props.row.runCount}</KeyValueRow>
+      <KeyValueRow label="Created">{dateTime(props.row.time.created)}</KeyValueRow>
+      <KeyValueRow label="Chat">{destination(props.ctx, props.row)}</KeyValueRow>
+      <KeyValueRow label="Model">{modelLabel()}</KeyValueRow>
+      <KeyValueRow label="Folder" last={!props.row.multiServer}>
+        {props.row.directory}
+      </KeyValueRow>
+      <Show when={props.row.multiServer}>
+        <KeyValueRow label="Server" last>
+          {props.row.serverLabel}
+        </KeyValueRow>
       </Show>
-      <div
-        style={{
-          display: "flex",
-          "align-items": "flex-start",
-          gap: "12px",
-          "flex-wrap": props.compact ? "wrap" : "nowrap",
-        }}
-      >
-        <div style={{ flex: 1, "min-width": 0 }}>
-          <div style={{ display: "flex", "align-items": "center", gap: "8px" }}>
-            <Dot color={statusColor(props.row)} size={6} />
-            <h2 style={{ margin: 0, color: text, "font-size": "15px", "font-weight": 640, "line-height": "20px", "letter-spacing": "-0.04px", overflow: "hidden", "text-overflow": "ellipsis" }}>
-              {props.row.name}
-            </h2>
-            <span
-              style={{
-                color: statusColor(props.row),
-                "font-size": "11px",
-                "font-weight": 530,
-                "flex-shrink": 0,
-              }}
-            >
-              {statusLabel(props.row)}
-            </span>
+    </>
+  )
+
+  const runsPane = () => (
+    <Show
+      when={props.row.lastOutput || history().length > 0}
+      fallback={<EmptyState title="No runs yet" description="Runs appear here after the task fires." />}
+    >
+      <div style={{ display: "flex", "flex-direction": "column", gap: "16px", "min-width": 0 }}>
+        <Show when={props.row.lastOutput}>
+          <div style={{ display: "flex", "flex-direction": "column", gap: "8px", "min-width": 0 }}>
+            <div style={{ color: text, "font-size": "13px", "font-weight": 530, "letter-spacing": "-0.04px" }}>
+              Last output
+            </div>
+            <div class="sched-code" style={{ "max-height": "180px" }}>
+              <props.ctx.ui.Code content={props.row.lastOutput ?? ""} language="text" />
+            </div>
           </div>
-          <div style={{ color: muted, "font-size": "12px", "font-weight": 440, "margin-top": "3px" }}>
-            {cadence(props.row)} · {props.row.tz}
-            <Show when={props.row.multiServer}> · {props.row.serverLabel}</Show>
+        </Show>
+        <Show when={history().length > 0}>
+          <div style={{ display: "flex", "flex-direction": "column", gap: "8px", "min-width": 0 }}>
+            <div style={{ color: text, "font-size": "13px", "font-weight": 530, "letter-spacing": "-0.04px" }}>
+              Recent runs
+            </div>
+            <div style={{ display: "flex", "flex-direction": "column", "min-width": 0 }}>
+              <For each={history()}>
+                {(entry) => (
+                  <div style={{ display: "flex", "align-items": "baseline", gap: "12px", padding: "6px 0", "font-size": "11px", "font-weight": 440, "line-height": "16px", color: muted, "min-width": 0 }}>
+                    <span style={{ color: faint, "flex-shrink": 0, "white-space": "nowrap" }}>{dateTime(entry.at)}</span>
+                    <span style={{ color: entry.outcome === "failed" ? danger : text, "flex-shrink": 0, "white-space": "nowrap" }}>
+                      {outcomeLabel(entry.outcome)}
+                    </span>
+                    <span style={{ overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap", "min-width": 0 }}>
+                      {entry.output || "—"}
+                    </span>
+                  </div>
+                )}
+              </For>
+            </div>
           </div>
-        </div>
-        <div
+        </Show>
+      </div>
+    </Show>
+  )
+
+  return (
+    <div style={{ display: "flex", "flex-direction": "column", flex: 1, "min-height": 0 }}>
+      <HeaderBar>
+        <Show when={props.onBack}>
+          <props.ctx.ui.IconButton
+            icon="arrow-left"
+            label="Back"
+            size="small"
+            onClick={() => props.onBack?.()}
+          />
+        </Show>
+        <Dot color={statusColor(props.row)} size={6} />
+        <span
           style={{
-            display: "flex",
-            gap: "7px",
-            "flex-wrap": "wrap",
-            "justify-content": props.compact ? "flex-start" : "flex-end",
-            width: props.compact ? "100%" : undefined,
+            color: text,
+            "font-size": "15px",
+            "font-weight": 530,
+            "line-height": "20px",
+            "letter-spacing": "-0.13px",
+            "min-width": 0,
+            overflow: "hidden",
+            "text-overflow": "ellipsis",
+            "white-space": "nowrap",
           }}
         >
-          <props.ctx.ui.Button size="small" onClick={openChat}>
-            Open chat
-          </props.ctx.ui.Button>
-          <Show when={props.row.status !== "done"}>
-            <props.ctx.ui.Button size="small" disabled={busy()} onClick={() => void toggle()}>
-              {props.row.status === "paused" ? "Resume" : "Pause"}
+          {props.row.name}
+        </span>
+        <span
+          style={{
+            color: statusColor(props.row),
+            "font-size": "11px",
+            "font-weight": 530,
+            "flex-shrink": 0,
+            "white-space": "nowrap",
+          }}
+        >
+          {statusLabel(props.row)}
+        </span>
+        <div style={{ flex: 1, "min-width": 0 }} />
+        <div style={{ display: "flex", "align-items": "center", gap: "6px", "flex-shrink": 0 }}>
+          <Show when={props.row.action.type === "prompt" && hasChat()}>
+            <props.ctx.ui.Button
+              variant="contrast"
+              size="small"
+              busy={running()}
+              disabled={busy() || running()}
+              onClick={() => void startRun()}
+            >
+              {running() ? "Running" : "Run task"}
             </props.ctx.ui.Button>
           </Show>
-          <props.ctx.ui.Button size="small" variant="danger" disabled={busy()} onClick={() => void remove()}>
-            Delete
-          </props.ctx.ui.Button>
+          <props.ctx.ui.Menu
+            label="Task actions"
+            items={[
+              { label: "Open chat", onSelect: openChat },
+              ...(props.row.status !== "done"
+                ? [
+                    {
+                      label: props.row.status === "paused" ? "Resume" : "Pause",
+                      disabled: busy(),
+                      onSelect: () => void toggle(),
+                    },
+                  ]
+                : []),
+              ...(props.row.trigger.type !== "event"
+                ? [{ label: "Edit", onSelect: () => props.onEdit() }]
+                : []),
+              { label: "Duplicate", onSelect: () => props.onDuplicate() },
+              { type: "separator" as const },
+              { label: "Delete", disabled: busy(), onSelect: () => void remove() },
+            ]}
+          />
         </div>
-      </div>
+      </HeaderBar>
 
       <div
         style={{
-          display: "grid",
-          "grid-template-columns": "1fr 1fr",
-          gap: "12px 18px",
-          background: panel,
-          "box-shadow": `inset 0 0 0 0.5px ${borderMuted}`,
-          "border-radius": "var(--radius-lg, 8px)",
-          padding: "12px 14px",
+          padding: "8px 12px 12px",
+          color: muted,
+          "font-size": "11px",
+          "font-weight": 440,
+          "line-height": "16px",
+          "min-width": 0,
+          "overflow-wrap": "anywhere",
         }}
       >
-        <Section meta title="Next run">{props.row.nextDueAt ? `${dateTime(props.row.nextDueAt)} · ${relative(props.row.nextDueAt)}` : "—"}</Section>
-        <Section meta title="Last run">
-          {props.row.lastRunAt ? `${dateTime(props.row.lastRunAt)} · ${relative(props.row.lastRunAt)}` : "—"}
-          <Show when={props.row.lastOutcome}>
-            <span style={{ color: props.row.lastOutcome === "failed" ? danger : muted }}> · {outcomeLabel(props.row.lastOutcome)}</span>
-          </Show>
-        </Section>
-        <Section meta title="Runs">{props.row.runCount}</Section>
-        <Section meta title="Created">{dateTime(props.row.time.created)}</Section>
-        <Section meta wide title="Destination">{destination(props.ctx, props.row)}</Section>
-        <Section meta wide title="Model">{modelLabel()}</Section>
-        <Section meta wide title="Folder">{props.row.directory}</Section>
+        {summary()}
       </div>
 
       <Show when={props.row.action.type === "prompt"}>
-        <Section title="Prompt">
-          <div style={{ display: "flex", "flex-direction": "column", gap: "9px" }}>
-            <div class="sched-code" style={{ "max-height": "240px" }}>
-              <props.ctx.ui.Code content={props.row.action.type === "prompt" ? props.row.action.prompt : ""} language="text" />
-            </div>
-            <div style={{ display: "flex", gap: "7px", "flex-wrap": "wrap", "align-items": "center" }}>
-              <Show when={target()}>
-                <props.ctx.ui.Button
-                  size="small"
-                  variant="contrast"
-                  disabled={busy() || running()}
-                  onClick={() => void startRun()}
-                >
-                  <Show when={running()}>
-                    <props.ctx.ui.Loader size="small" />
-                  </Show>
-                  {running() ? "Running" : "Run task"}
-                </props.ctx.ui.Button>
-              </Show>
-              <props.ctx.ui.Button
-                size="small"
-                variant="ghost"
-                class="sched-copy"
-                icon={copied() ? "check" : "copy"}
-                onClick={() => void copyPrompt()}
-              >
-                {copied() ? "Copied" : "Copy prompt"}
-              </props.ctx.ui.Button>
-              <props.ctx.ui.Button size="small" variant="ghost" onClick={props.onDuplicate}>
-                Duplicate
-              </props.ctx.ui.Button>
-              <Show when={props.row.trigger.type !== "event"}>
-                <props.ctx.ui.Button size="small" variant="ghost" onClick={props.onEdit}>
-                  Edit
-                </props.ctx.ui.Button>
-              </Show>
-            </div>
+        <div style={{ padding: "0 12px 12px", "min-width": 0 }}>
+          <div class="sched-code" style={{ "max-height": "160px" }}>
+            <props.ctx.ui.Code content={props.row.action.type === "prompt" ? props.row.action.prompt : ""} language="text" />
           </div>
-        </Section>
+        </div>
       </Show>
 
-      <Show when={target()}>
-        <Section title="Chat">
-          <SessionChat ctx={props.ctx} messages={chatMessages()} loading={chatLoading()} running={running()} error={chatError()} />
-        </Section>
-      </Show>
+      <TabStrip tabs={tabs()} active={tab()} onChange={setTab} />
 
-      <Show when={props.row.lastOutput}>
-        <Section title="Last output">
-          <div class="sched-code" style={{ "max-height": "180px" }}>
-            <props.ctx.ui.Code content={props.row.lastOutput ?? ""} language="text" />
+      <Show
+        when={tab() === "chat"}
+        fallback={
+          <div style={{ display: "flex", "flex-direction": "column", flex: 1, "min-height": 0, "overflow-y": "auto", padding: "12px" }}>
+            <Show when={tab() === "details"} fallback={runsPane()}>
+              {detailsPane()}
+            </Show>
           </div>
-        </Section>
-      </Show>
-
-      <Show when={history().length > 0}>
-        <Section title="Recent runs seen in this app">
-          <div style={{ display: "flex", "flex-direction": "column", gap: "4px" }}>
-            <For each={history()}>
-              {(entry) => (
-                <div style={{ display: "flex", gap: "8px", "font-size": "12px", color: muted }}>
-                  <span style={{ color: faint, width: "96px", "flex-shrink": 0 }}>{dateTime(entry.at)}</span>
-                  <span style={{ color: entry.outcome === "failed" ? danger : text, width: "72px", "flex-shrink": 0 }}>
-                    {outcomeLabel(entry.outcome)}
-                  </span>
-                  <span style={{ overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{entry.output || "—"}</span>
-                </div>
-              )}
-            </For>
-          </div>
-        </Section>
+        }
+      >
+        <div style={{ display: "flex", "flex-direction": "column", flex: 1, "min-height": 0, padding: "12px" }}>
+          <SessionChat
+            ctx={props.ctx}
+            messages={chatMessages()}
+            loading={chatLoading()}
+            running={running()}
+            error={chatError()}
+            fill
+          />
+        </div>
       </Show>
     </div>
   )
@@ -1020,18 +1252,18 @@ function toLocalInput(ms: number) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
 }
 
-function parseEvery(value: string) {
+function parseEvery(value: string): { n: number; unit: EveryUnit } {
   const match = value.trim().match(/^(\d+)\s+(second|minute|hour|day)s?$/i)
-  if (!match) return { n: 1, unit: "hours" as const }
+  if (!match) return { n: 1, unit: "hours" }
   const n = Number(match[1])
   const raw = match[2].toLowerCase()
-  const unit = raw.startsWith("second") ? "minutes" : raw.startsWith("minute") ? "minutes" : raw.startsWith("hour") ? "hours" : "days"
+  const unit: EveryUnit = raw.startsWith("second") ? "minutes" : raw.startsWith("minute") ? "minutes" : raw.startsWith("hour") ? "hours" : "days"
   return { n, unit }
 }
 
 function Field(props: { label: string; hint?: string; children: any }) {
   return (
-    <label style={{ display: "flex", "flex-direction": "column", gap: "6px" }}>
+    <label style={{ display: "flex", "flex-direction": "column", gap: "8px" }}>
       <span style={{ color: text, "font-size": "13px", "font-weight": 530, "letter-spacing": "-0.04px", "line-height": "16px" }}>{props.label}</span>
       {props.children}
       <Show when={props.hint}>
@@ -1048,6 +1280,7 @@ function ScheduledForm(props: {
   clone?: Row
   initialPrompt?: string
   targetSession?: any
+  preferCurrent?: boolean
   embedded?: boolean
   onDone: (created: AutomationInfo, server: string) => void
   onCancel: () => void
@@ -1105,7 +1338,9 @@ function ScheduledForm(props: {
   })
   const [targetMode, setTargetMode] = createSignal<FormMode>(
     !source
-      ? "new"
+      ? props.preferCurrent
+        ? "current"
+        : "new"
       : source.action.type === "prompt" && source.action.to?.subagent
         ? "child"
         : source.action.type === "prompt" && source.action.to?.session && source.action.to.session !== source.sessionID
@@ -1115,8 +1350,18 @@ function ScheduledForm(props: {
   const [otherID, setOtherID] = createSignal(
     source?.action.type === "prompt" && source.action.to?.session ? source.action.to.session! : "",
   )
+  const targetOptions = () => {
+    const currentOption = { value: "current", label: "This session" }
+    const rest = [
+      { value: "other", label: "Another open chat" },
+      { value: "child", label: "New child chat each run" },
+    ]
+    if (source) return [currentOption, ...rest]
+    const newOption = { value: "new", label: "New session in Scheduled project" }
+    return props.preferCurrent ? [currentOption, newOption, ...rest] : [newOption, currentOption, ...rest]
+  }
   const initialTrigger = source?.trigger
-  const initialEvery = initialTrigger?.type === "every" ? parseEvery(initialTrigger.every) : { n: 1, unit: "hours" as const }
+  const initialEvery: { n: number; unit: EveryUnit } = initialTrigger?.type === "every" ? parseEvery(initialTrigger.every) : { n: 1, unit: "hours" }
   const [scheduleMode, setScheduleMode] = createSignal<ScheduleMode>(
     initialTrigger?.type === "at" ? "once" : initialTrigger?.type === "every" ? "every" : "cron",
   )
@@ -1129,7 +1374,7 @@ function ScheduledForm(props: {
       : toLocalInput(Date.now() + 10 * 60_000),
   )
   const [everyN, setEveryN] = createSignal(String(initialEvery.n))
-  const [everyUnit, setEveryUnit] = createSignal(initialEvery.unit)
+  const [everyUnit, setEveryUnit] = createSignal<EveryUnit>(initialEvery.unit)
   const [cron, setCron] = createSignal(initialTrigger?.type === "cron" ? initialTrigger.cron : "0 9 * * 1-5")
   const [tz, setTz] = createSignal(seed()?.tz ?? Intl.DateTimeFormat().resolvedOptions().timeZone)
   const [expires, setExpires] = createSignal(seed()?.expires ? toLocalInput(seed()!.expires!) : "")
@@ -1358,6 +1603,14 @@ function ScheduledForm(props: {
       const created = (await server.client.experimental.automation.create(payload)) as AutomationInfo
       createdAutomation = true
 
+      if (wantsNewSession && createdSession) {
+        props.monitor.markOwned(`${server.id}\0${created.id}`, createdSession)
+      }
+      const replacementChat =
+        targetMode() === "current" ? sessionID : targetMode() === "other" ? otherID() : undefined
+      const previousOwner =
+        props.row && props.monitor.ownsChat(props.row) ? targetSessionID(props.row) : undefined
+
       if (props.row) {
         const oldServer = props.ctx.servers.get(props.row.server)
         if (!oldServer) throw new Error("The original server is not connected.")
@@ -1382,6 +1635,9 @@ function ScheduledForm(props: {
           .pause({ automationID: created.id })
           .catch(() => undefined)
       }
+      if (previousOwner && replacementChat === previousOwner) {
+        props.monitor.markOwned(`${server.id}\0${created.id}`, previousOwner)
+      }
       await props.monitor.refresh()
       props.ctx.toast.show({
         variant: "success",
@@ -1401,237 +1657,275 @@ function ScheduledForm(props: {
   }
 
   return (
-    <div
-      style={{
-        display: "flex",
-        "flex-direction": "column",
-        gap: "13px",
-        "max-height": props.embedded ? "none" : "64vh",
-        "overflow-y": props.embedded ? "visible" : "auto",
-        "padding-right": "4px",
-      }}
-    >
-      <div style={{ display: "flex", "align-items": "center", gap: "12px" }}>
-        <div style={{ flex: 1 }}>
-          <div style={{ color: text, "font-size": "15px", "font-weight": 640, "line-height": "20px", "letter-spacing": "-0.04px" }}>
-            {props.row ? "Edit scheduled task" : props.clone ? "Duplicate scheduled task" : "New scheduled task"}
-          </div>
-          <div style={{ color: muted, "font-size": "12px", "font-weight": 440, "margin-top": "2px" }}>
-            {targetMode() === "new"
-              ? getScheduledDirectory()
-                ? `Tied to: a new session in ${getScheduledDirectory()}`
-                : "Tied to: set the Scheduled project directory in the plugin options."
-              : current()
-                ? `Tied to: ${chatTitle(props.ctx, current().server.id, current().id)}`
-                : "Open a chat to schedule work."}
-          </div>
-        </div>
-        <Show when={!props.embedded}>
-          <props.ctx.ui.Button size="small" variant="ghost" onClick={props.onCancel}>
-            Cancel
-          </props.ctx.ui.Button>
+    <div style={{ display: "flex", "flex-direction": "column", flex: 1, "min-height": 0 }}>
+      <HeaderBar>
+        <Show when={props.embedded}>
+          <props.ctx.ui.IconButton
+            icon="arrow-left"
+            label="Back"
+            size="small"
+            onClick={() => props.onCancel()}
+          />
         </Show>
+        <span
+          style={{
+            color: text,
+            "font-size": "15px",
+            "font-weight": 530,
+            "line-height": "20px",
+            "letter-spacing": "-0.13px",
+            "min-width": 0,
+            overflow: "hidden",
+            "text-overflow": "ellipsis",
+            "white-space": "nowrap",
+          }}
+        >
+          {props.row ? "Edit scheduled task" : props.clone ? "Duplicate scheduled task" : "New scheduled task"}
+        </span>
+      </HeaderBar>
+
+      <div
+        style={{
+          padding: "8px 12px 0",
+          color: muted,
+          "font-size": "11px",
+          "font-weight": 440,
+          "line-height": "16px",
+          "min-width": 0,
+          "overflow-wrap": "anywhere",
+        }}
+      >
+        {targetMode() === "new"
+          ? getScheduledDirectory()
+            ? `Tied to: a new session in ${getScheduledDirectory()}`
+            : "Tied to: set the Scheduled project directory in the plugin options."
+          : current()
+            ? `Tied to: ${chatTitle(props.ctx, current().server.id, current().id)}`
+            : "Open a chat to schedule work."}
       </div>
 
-      <Show when={props.row}>
-        <div style={{ display: "flex", "align-items": "flex-start", gap: "8px", color: text, "font-size": "12px", "font-weight": 440, "line-height": "18px", background: panel, border: `0.5px solid ${border}`, "border-radius": "var(--radius-md, 6px)", padding: "8px 10px" }}>
-          <span style={{ color: warning, "flex-shrink": 0, "margin-top": "1px" }}>
-            <props.ctx.ui.Icon name="circle-exclamation" size="small" />
-          </span>
-          <span>Editing replaces the task, so its run count restarts. The chat and its messages are untouched.</span>
-        </div>
-      </Show>
+      <div
+        style={{
+          flex: 1,
+          "min-height": 0,
+          "overflow-y": "auto",
+          padding: "12px",
+          display: "flex",
+          "flex-direction": "column",
+          gap: "16px",
+        }}
+      >
+        <Show when={props.row}>
+          <div style={{ display: "flex", "align-items": "flex-start", gap: "8px", color: text, "font-size": "13px", "font-weight": 440, "line-height": "20px", background: panel, border: `0.5px solid ${border}`, "border-radius": "var(--radius-md, 6px)", padding: "8px 10px" }}>
+            <span style={{ color: warning, "flex-shrink": 0, "margin-top": "2px" }}>
+              <props.ctx.ui.Icon name="circle-exclamation" size="small" />
+            </span>
+            <span style={{ "min-width": 0 }}>Editing replaces the task, so its run count restarts. The chat and its messages are untouched.</span>
+          </div>
+        </Show>
 
-      <Field label="Name">
-        <input
-          class="sched-input"
-          style={inputStyle}
-          value={name()}
-          onInput={(event) => {
-            setNameEdited(true)
-            setName(event.currentTarget.value)
-            setError(undefined)
-            setDuplicate(undefined)
-          }}
-        />
-      </Field>
-
-      <Field label="Prompt" hint="Write it so it still makes sense days from now, without this conversation.">
-        <textarea
-          class="sched-input"
-          style={{ ...inputStyle, "min-height": "110px", resize: "vertical", "font-family": "inherit" }}
-          value={prompt()}
-          onInput={(event) => {
-            setPrompt(event.currentTarget.value)
-            setError(undefined)
-            setDuplicate(undefined)
-          }}
-          placeholder="Check the deploy, summarize what changed, and report only if something needs attention."
-        />
-      </Field>
-
-      <div style={{ display: "grid", "grid-template-columns": "1fr 1fr", gap: "12px" }}>
-        <Field label="Send to">
-          <props.ctx.ui.Select
-            label="Send to"
-            value={targetMode()}
-            onChange={(value: string) => setTargetMode(value as FormMode)}
-            options={[
-              ...(seed() ? [] : [{ value: "new", label: "New session in Scheduled project" }]),
-              { value: "current", label: "This chat" },
-              { value: "other", label: "Another open chat" },
-              { value: "child", label: "New child chat each run" },
-            ]}
+        <Field label="Name">
+          <props.ctx.ui.TextInput
+            class="sched-field"
+            label="Name"
+            value={name()}
+            invalid={!name().trim() && !!error()}
+            onInput={(value: string) => {
+              setNameEdited(true)
+              setName(value)
+              setError(undefined)
+              setDuplicate(undefined)
+            }}
           />
         </Field>
-        <Show when={targetMode() === "new"}>
-          <div style={{ color: muted, "font-size": "11px", "font-weight": 440, "line-height": "16px", "grid-column": "1 / -1" }}>
-            Each task gets its own chat in the Scheduled project. Its runs appear there, and the dashboard links to it.
-          </div>
-        </Show>
-        <Show when={targetMode() === "other"}>
-          <Field label="Chat">
+
+        <Field label="Prompt" hint="Write it so it still makes sense days from now, without this conversation.">
+          <textarea
+            class="sched-input"
+            style={{ ...inputStyle, "min-height": "110px", "line-height": "20px", resize: "vertical", "font-family": "inherit" }}
+            value={prompt()}
+            onInput={(event) => {
+              setPrompt(event.currentTarget.value)
+              setError(undefined)
+              setDuplicate(undefined)
+            }}
+            placeholder="Check the deploy, summarize what changed, and report only if something needs attention."
+          />
+        </Field>
+
+        <div style={{ display: "grid", "grid-template-columns": "1fr 1fr", gap: "12px" }}>
+          <Field label="Send to">
             <props.ctx.ui.Select
-              label="Chat"
-              value={otherID()}
-              placeholder={otherOptions().length ? "Choose a chat" : "No other open chats"}
-              onChange={setOtherID}
-              options={otherOptions()}
+              label="Send to"
+              value={targetMode()}
+              onChange={(value: string) => setTargetMode(value as FormMode)}
+              options={targetOptions()}
             />
           </Field>
-        </Show>
-        <Show when={targetMode() === "child"}>
-          <Field label="Child agent" hint="Each run starts a fresh child session with this agent.">
-            <input class="sched-input" style={{ ...inputStyle, opacity: 0.8 }} value="general" readOnly />
-          </Field>
-        </Show>
-      </div>
-
-      <Show when={targetMode() === "new"}>
-        <Field
-          label="Model"
-          hint={
-            models().length > 0
-              ? "The new task chat starts on this model."
-              : "The new task chat inherits the model from this chat."
-          }
-        >
-          <Show
-            when={models().length > 0}
-            fallback={
-              <input
-                class="sched-input" style={{ ...inputStyle, opacity: 0.8 }}
-                value={templateModel ? `${templateModel.providerID}/${templateModel.id}` : "Inherited from this chat"}
-                readOnly
+          <Show when={targetMode() === "new"}>
+            <div style={{ color: muted, "font-size": "11px", "font-weight": 440, "line-height": "16px", "grid-column": "1 / -1" }}>
+              Each task gets its own chat in the Scheduled project. Its runs appear there, and the dashboard links to it.
+            </div>
+          </Show>
+          <Show when={targetMode() === "other"}>
+            <Field label="Chat">
+              <props.ctx.ui.Select
+                label="Chat"
+                value={otherID()}
+                placeholder={otherOptions().length ? "Choose a chat" : "No other open chats"}
+                onChange={setOtherID}
+                options={otherOptions()}
               />
+            </Field>
+          </Show>
+          <Show when={targetMode() === "child"}>
+            <Field label="Child agent" hint="Each run starts a fresh child session with this agent.">
+              <props.ctx.ui.TextInput
+                class="sched-field"
+                label="Child agent"
+                value="general"
+                disabled
+                onInput={() => undefined}
+              />
+            </Field>
+          </Show>
+        </div>
+
+        <Show when={targetMode() === "new"}>
+          <Field
+            label="Model"
+            hint={
+              models().length > 0
+                ? "The new task chat starts on this model."
+                : "The new task chat inherits the model from this chat."
             }
           >
-            <props.ctx.ui.Select
-              label="Model"
-              value={modelKey()}
-              onChange={setModelKey}
-              placeholder="Choose a model"
-              options={models().map((option) => ({ value: option.value, label: option.label }))}
-            />
-          </Show>
-        </Field>
-      </Show>
-
-      <div style={{ display: "grid", "grid-template-columns": "1fr 1fr", gap: "12px" }}>
-        <Field label="Schedule">
-          <props.ctx.ui.Select
-            label="Schedule"
-            value={scheduleMode()}
-            onChange={(value: string) => setScheduleMode(value as ScheduleMode)}
-            options={[
-              { value: "once", label: "Once" },
-              { value: "every", label: "Every interval" },
-              { value: "cron", label: "Cron / calendar" },
-            ]}
-          />
-        </Field>
-        <Field label="Time zone">
-          <input class="sched-input" style={inputStyle} value={tz()} onInput={(event) => setTz(event.currentTarget.value)} />
-        </Field>
-      </div>
-
-      <Show when={scheduleMode() === "once"}>
-        <Field label="Run at">
-          <input class="sched-input" type="datetime-local" style={inputStyle} value={onceAt()} onInput={(event) => setOnceAt(event.currentTarget.value)} />
-        </Field>
-      </Show>
-
-      <Show when={scheduleMode() === "every"}>
-        <div style={{ display: "grid", "grid-template-columns": "120px 1fr", gap: "12px" }}>
-          <Field label="Repeat every">
-            <input class="sched-input" style={inputStyle} value={everyN()} onInput={(event) => setEveryN(event.currentTarget.value)} />
+            <Show
+              when={models().length > 0}
+              fallback={
+                <props.ctx.ui.TextInput
+                  class="sched-field"
+                  label="Model"
+                  value={templateModel ? `${templateModel.providerID}/${templateModel.id}` : "Inherited from this chat"}
+                  disabled
+                  onInput={() => undefined}
+                />
+              }
+            >
+              <props.ctx.ui.Select
+                label="Model"
+                value={modelKey()}
+                onChange={setModelKey}
+                placeholder="Choose a model"
+                options={models().map((option) => ({ value: option.value, label: option.label }))}
+              />
+            </Show>
           </Field>
-          <Field label="Unit">
+        </Show>
+
+        <div style={{ display: "grid", "grid-template-columns": "1fr 1fr", gap: "12px" }}>
+          <Field label="Schedule">
             <props.ctx.ui.Select
-              label="Unit"
-              value={everyUnit()}
-              onChange={(value: string) => setEveryUnit(value as any)}
+              label="Schedule"
+              value={scheduleMode()}
+              onChange={(value: string) => setScheduleMode(value as ScheduleMode)}
               options={[
-                { value: "minutes", label: "Minutes" },
-                { value: "hours", label: "Hours" },
-                { value: "days", label: "Days" },
+                { value: "once", label: "Once" },
+                { value: "every", label: "Every interval" },
+                { value: "cron", label: "Cron / calendar" },
               ]}
             />
           </Field>
+          <Field label="Time zone">
+            <props.ctx.ui.TextInput class="sched-field" label="Time zone" value={tz()} onInput={setTz} />
+          </Field>
         </div>
-      </Show>
 
-      <Show when={scheduleMode() === "cron"}>
-        <Field label="Cron expression" hint="Five fields: minute hour day-of-month month day-of-week. Runs at most once a minute.">
-          <input class="sched-input" style={inputStyle} value={cron()} onInput={(event) => setCron(event.currentTarget.value)} placeholder="0 9 * * 1-5" />
-        </Field>
-        <div style={{ display: "flex", gap: "6px", "flex-wrap": "wrap" }}>
-          <For each={[
-            { label: "Daily 09:00", value: "0 9 * * *" },
-            { label: "Weekdays 09:00", value: "0 9 * * 1-5" },
-            { label: "Mondays 09:00", value: "0 9 * * 1" },
-            { label: "Hourly", value: "0 * * * *" },
-          ]}>
-            {(preset) => (
-              <props.ctx.ui.Button size="small" variant="ghost" onClick={() => setCron(preset.value)}>
-                {preset.label}
-              </props.ctx.ui.Button>
-            )}
-          </For>
-        </div>
-      </Show>
+        <Show when={scheduleMode() === "once"}>
+          <Field label="Run at">
+            <input class="sched-input" type="datetime-local" style={inputStyle} value={onceAt()} onInput={(event) => setOnceAt(event.currentTarget.value)} />
+          </Field>
+        </Show>
 
-      <Field label="Expires (optional)" hint="Leave empty to keep the task until you delete it.">
-        <input class="sched-input" type="datetime-local" style={inputStyle} value={expires()} onInput={(event) => setExpires(event.currentTarget.value)} />
-      </Field>
+        <Show when={scheduleMode() === "every"}>
+          <div style={{ display: "grid", "grid-template-columns": "120px 1fr", gap: "12px" }}>
+            <Field label="Repeat every">
+              <props.ctx.ui.TextInput class="sched-field" label="Repeat every" value={everyN()} onInput={setEveryN} />
+            </Field>
+            <Field label="Unit">
+              <props.ctx.ui.Select
+                label="Unit"
+                value={everyUnit()}
+                onChange={(value: string) => setEveryUnit(value as EveryUnit)}
+                options={[
+                  { value: "minutes", label: "Minutes" },
+                  { value: "hours", label: "Hours" },
+                  { value: "days", label: "Days" },
+                ]}
+              />
+            </Field>
+          </div>
+        </Show>
 
-      <Show when={targetMode() === "child"}>
-        <div style={{ color: muted, "font-size": "11px", "font-weight": 440, "line-height": "16px" }}>
-          Each run creates a child session under this chat. The child does not report back, but the last child is linked from the task.
-        </div>
-      </Show>
-
-      <Show when={error()}>
-        <div style={{ color: danger, "font-size": "12px", "font-weight": 440, "line-height": "18px", background: `color-mix(in srgb, ${danger} 8%, transparent)`, border: `0.5px solid ${danger}`, "border-radius": "var(--radius-md, 6px)", padding: "8px 10px" }}>
-          <div>{error()}</div>
-          <Show when={duplicate()}>
-            {(row) => (
-              <div style={{ "margin-top": "6px" }}>
-                <props.ctx.ui.Button
-                  size="small"
-                  variant="ghost"
-                  onClick={() => props.onOpenExisting?.(row())}
-                  disabled={!props.onOpenExisting}
-                >
-                  Open “{row().name}”
+        <Show when={scheduleMode() === "cron"}>
+          <Field label="Cron expression" hint="Five fields: minute hour day-of-month month day-of-week. Runs at most once a minute.">
+            <props.ctx.ui.TextInput
+              class="sched-field"
+              label="Cron expression"
+              value={cron()}
+              placeholder="0 9 * * 1-5"
+              invalid={!cron().trim() && !!error()}
+              onInput={setCron}
+            />
+          </Field>
+          <div style={{ display: "flex", gap: "6px", "flex-wrap": "wrap" }}>
+            <For each={[
+              { label: "Daily 09:00", value: "0 9 * * *" },
+              { label: "Weekdays 09:00", value: "0 9 * * 1-5" },
+              { label: "Mondays 09:00", value: "0 9 * * 1" },
+              { label: "Hourly", value: "0 * * * *" },
+            ]}>
+              {(preset) => (
+                <props.ctx.ui.Button size="small" variant="ghost" onClick={() => setCron(preset.value)}>
+                  {preset.label}
                 </props.ctx.ui.Button>
-              </div>
-            )}
-          </Show>
-        </div>
-      </Show>
+              )}
+            </For>
+          </div>
+        </Show>
 
-      <div style={{ display: "flex", gap: "8px", "justify-content": "flex-end", "padding-top": "2px" }}>
+        <Field label="Expires (optional)" hint="Leave empty to keep the task until you delete it.">
+          <input class="sched-input" type="datetime-local" style={inputStyle} value={expires()} onInput={(event) => setExpires(event.currentTarget.value)} />
+        </Field>
+
+        <Show when={targetMode() === "child"}>
+          <div style={{ color: muted, "font-size": "11px", "font-weight": 440, "line-height": "16px" }}>
+            Each run creates a child session under this chat. The child does not report back, but the last child is linked from the task.
+          </div>
+        </Show>
+
+        <Show when={error()}>
+          <ErrorNotice ctx={props.ctx}>
+            <div>{error()}</div>
+            <Show when={duplicate()}>
+              {(row) => (
+                <div style={{ "margin-top": "6px" }}>
+                  <props.ctx.ui.Button
+                    size="small"
+                    variant="ghost"
+                    onClick={() => props.onOpenExisting?.(row())}
+                    disabled={!props.onOpenExisting}
+                  >
+                    Open “{row().name}”
+                  </props.ctx.ui.Button>
+                </div>
+              )}
+            </Show>
+          </ErrorNotice>
+        </Show>
+      </div>
+
+      <div style={{ display: "flex", "justify-content": "flex-end", gap: "8px", padding: "12px", "border-top": `1px solid ${border}`, "flex-shrink": 0 }}>
         <props.ctx.ui.Button variant="ghost" onClick={props.onCancel}>
           Cancel
         </props.ctx.ui.Button>
@@ -1646,10 +1940,13 @@ function ScheduledForm(props: {
 function ScheduledPanel(props: {
   ctx: any
   monitor: Monitor
+  session?: () => DockedSession | undefined
   requested: () => { nonce: number; prompt?: string; session?: any; consumed?: boolean }
   onConsume: () => void
 }) {
   const [mode, setMode] = createSignal<"list" | "create">("list")
+  const [scoped, setScoped] = createSignal(false)
+  const [preferCurrent, setPreferCurrent] = createSignal(false)
   const [editing, setEditing] = createSignal<Row | undefined>()
   const [clone, setClone] = createSignal<Row | undefined>()
   const [filter, setFilter] = createSignal<Filter>("all")
@@ -1659,8 +1956,15 @@ function ScheduledPanel(props: {
   const [bootSession, setBootSession] = createSignal<any>()
   const [formNonce, setFormNonce] = createSignal(0)
 
-  const counts = createMemo(() => {
+  const docked = () => props.session?.()
+  const scopedRows = createMemo(() => {
+    const session = docked()
     const rows = props.monitor.rows()
+    return scoped() && session ? rows.filter((row) => belongsToSession(row, session)) : rows
+  })
+
+  const counts = createMemo(() => {
+    const rows = scopedRows()
     return {
       all: rows.length,
       active: rows.filter((row) => row.status === "active").length,
@@ -1671,7 +1975,7 @@ function ScheduledPanel(props: {
 
   const filtered = createMemo(() => {
     const needle = query().trim().toLowerCase()
-    return props.monitor.rows().filter((row) => {
+    return scopedRows().filter((row) => {
       if (filter() !== "all" && row.status !== filter()) return false
       if (!needle) return true
       return [
@@ -1698,12 +2002,15 @@ function ScheduledPanel(props: {
     setEditing(row)
     setClone(copy)
     setBootPrompt(undefined)
-    setBootSession(undefined)
+    const session = !row && !copy && scoped() ? docked() : undefined
+    setBootSession(session)
+    setPreferCurrent(!!session)
     setFormNonce((value) => value + 1)
     setMode("create")
   }
 
-  const done = (created: AutomationInfo, server: string) => {
+  // Opens a task's screen, clearing any filter (including the session scope) that would hide it.
+  const reveal = (key: string) => {
     setEditing(undefined)
     setClone(undefined)
     setBootPrompt(undefined)
@@ -1711,19 +2018,15 @@ function ScheduledPanel(props: {
     setMode("list")
     setFilter("all")
     setQuery("")
-    setSelected(`${server}\0${created.id}`)
+    const session = docked()
+    const row = props.monitor.rows().find((item) => item.key === key)
+    if (scoped() && session && row && !belongsToSession(row, session)) setScoped(false)
+    setSelected(key)
   }
 
-  const openExisting = (row: Row) => {
-    setEditing(undefined)
-    setClone(undefined)
-    setBootPrompt(undefined)
-    setBootSession(undefined)
-    setMode("list")
-    setFilter("all")
-    setQuery("")
-    setSelected(row.key)
-  }
+  const done = (created: AutomationInfo, server: string) => reveal(`${server}\0${created.id}`)
+
+  const openExisting = (row: Row) => reveal(row.key)
 
   onMount(() => {
     props.monitor.markSeen()
@@ -1738,6 +2041,7 @@ function ScheduledPanel(props: {
     setClone(undefined)
     setBootPrompt(request.prompt)
     setBootSession(request.session)
+    setPreferCurrent(!!request.session)
     setFormNonce((value) => value + 1)
     setMode("create")
     props.onConsume()
@@ -1755,176 +2059,162 @@ function ScheduledPanel(props: {
       }}
     >
       <Styles />
-      <div
-        style={{
-          display: "flex",
-          "align-items": "center",
-          gap: "7px",
-          padding: "10px 12px",
-          "border-bottom": `1px solid ${border}`,
-          "flex-shrink": 0,
-        }}
-      >
-        <Show
-          when={props.monitor.activity()}
-          fallback={<div style={{ flex: 1 }} />}
-        >
-          <span
-            title={props.monitor.runningLabel()}
-            style={{
-              display: "inline-flex",
-              "align-items": "center",
-              gap: "5px",
-              color: muted,
-              "font-size": "11px",
-              "min-width": 0,
-              flex: 1,
-            }}
+      <Show when={mode() === "list" && !selectedRow()}>
+        <HeaderBar>
+          <Show
+            when={props.monitor.activity()}
+            fallback={<div style={{ flex: 1 }} />}
           >
-            <props.ctx.ui.Loader size="small" />
-            <span style={{ overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>
-              {props.monitor.runningLabel()}
+            <span
+              title={props.monitor.runningLabel()}
+              style={{
+                display: "inline-flex",
+                "align-items": "center",
+                gap: "5px",
+                color: muted,
+                "font-size": "11px",
+                "min-width": 0,
+                flex: 1,
+              }}
+            >
+              <props.ctx.ui.Loader size="small" />
+              <span style={{ overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>
+                {props.monitor.runningLabel()}
+              </span>
             </span>
-          </span>
-        </Show>
-        <props.ctx.ui.Button size="small" icon="plus" onClick={() => startCreate()}>
-          New task
-        </props.ctx.ui.Button>
-      </div>
+          </Show>
+          <props.ctx.ui.Button size="small" variant="contrast" icon="plus" onClick={() => startCreate()}>
+            New task
+          </props.ctx.ui.Button>
+        </HeaderBar>
+
+        <TabStrip
+          tabs={[
+            { id: "all", label: "All", count: counts().all },
+            { id: "active", label: "Active", count: counts().active },
+            { id: "paused", label: "Paused", count: counts().paused },
+            { id: "done", label: "Done", count: counts().done },
+          ]}
+          active={filter()}
+          onChange={(id) => setFilter(id as Filter)}
+          end={
+            docked() ? (
+              <props.ctx.ui.Switch label="This session" checked={scoped()} onChange={setScoped} />
+            ) : undefined
+          }
+        />
+
+        <div style={{ padding: "8px 12px", "flex-shrink": 0 }}>
+          <props.ctx.ui.TextInput class="sched-field" label="Search" value={query()} onInput={setQuery} placeholder="Search tasks" />
+        </div>
+      </Show>
 
       <Show when={props.monitor.error()}>
-        <div
-          style={{
-            color: danger,
-            "font-size": "12px",
-            "font-weight": 440,
-            "line-height": "18px",
-            background: `color-mix(in srgb, ${danger} 8%, transparent)`,
-            border: `0.5px solid ${danger}`,
-            "border-radius": "var(--radius-md, 6px)",
-            margin: "8px 10px 0",
-            padding: "8px 10px",
-          }}
-        >
-          {props.monitor.error()}
+        <div style={{ margin: "8px 12px 0" }}>
+          <ErrorNotice ctx={props.ctx}>{props.monitor.error()}</ErrorNotice>
         </div>
       </Show>
 
       <Show when={mode() === "list"}>
         <Show when={!selectedRow()}>
-          <div
-            style={{
-              display: "flex",
-              "align-items": "center",
-              gap: "6px",
-              height: "32px",
-              padding: "0 8px",
-              "border-bottom": `1px solid ${border}`,
-              "flex-shrink": 0,
-            }}
-          >
-            <FilterButton active={filter() === "all"} label="All" count={counts().all} onClick={() => setFilter("all")} />
-            <FilterButton active={filter() === "active"} label="Active" count={counts().active} onClick={() => setFilter("active")} />
-            <FilterButton active={filter() === "paused"} label="Paused" count={counts().paused} onClick={() => setFilter("paused")} />
-            <FilterButton active={filter() === "done"} label="Done" count={counts().done} onClick={() => setFilter("done")} />
-          </div>
-
-          <div style={{ padding: "8px 8px", "flex-shrink": 0 }}>
-            <props.ctx.ui.TextInput class="sched-search" label="Search" value={query()} onInput={setQuery} placeholder="Search tasks" />
-          </div>
-        </Show>
-
-        <div style={{ flex: 1, "min-height": 0, "overflow-y": "auto", padding: "0 6px 8px" }}>
-          <Show
-            when={selectedRow()}
-            fallback={
-              <Show
-                when={props.monitor.loading() && props.monitor.rows().length === 0}
-                fallback={
+          <div style={{ flex: 1, "min-height": 0, "overflow-y": "auto", padding: "0 6px 8px" }}>
+            <Show
+              when={props.monitor.loading() && props.monitor.rows().length === 0}
+              fallback={
+                <Show
+                  when={filtered().length === 0}
+                  fallback={
+                    <For each={filtered()}>
+                      {(row) => (
+                        <RowButton
+                          ctx={props.ctx}
+                          row={row}
+                          selected={false}
+                          unread={!!row.lastRunAt && row.lastRunAt > props.monitor.seenAt(row.id)}
+                          onClick={() => setSelected(row.key)}
+                        />
+                      )}
+                    </For>
+                  }
+                >
                   <Show
-                    when={filtered().length === 0}
+                    when={scoped() && !!docked() && scopedRows().length === 0}
                     fallback={
-                      <For each={filtered()}>
-                        {(row) => (
-                          <RowButton
-                            ctx={props.ctx}
-                            row={row}
-                            selected={false}
-                            unread={!!row.lastRunAt && row.lastRunAt > props.monitor.seenAt(row.id)}
-                            onClick={() => setSelected(row.key)}
-                          />
-                        )}
-                      </For>
-                    }
-                  >
-                    <div style={{ display: "flex", "flex-direction": "column", "align-items": "center", gap: "8px", padding: "36px 16px", "text-align": "center" }}>
                       <Show
                         when={props.monitor.rows().length === 0}
                         fallback={
-                          <>
-                            <div style={{ color: text, "font-size": "13px", "font-weight": 530 }}>Nothing matches this filter</div>
-                            <div style={{ color: muted, "font-size": "13px", "font-weight": 440, "line-height": "20px" }}>Try another filter or clear the search.</div>
-                          </>
+                          <EmptyState
+                            title="Nothing matches this filter"
+                            description="Try another filter or clear the search."
+                          />
                         }
                       >
-                        <div style={{ color: text, "font-size": "13px", "font-weight": 530 }}>No scheduled tasks yet</div>
-                        <div style={{ color: muted, "font-size": "13px", "font-weight": 440, "line-height": "20px", "max-width": "300px" }}>
-                          Create a prompt that runs on its own schedule in the Scheduled project.
-                        </div>
-                        <props.ctx.ui.Button size="small" variant="contrast" icon="plus" onClick={() => startCreate()}>
-                          New task
-                        </props.ctx.ui.Button>
+                        <EmptyState
+                          title="No scheduled tasks yet"
+                          description="Create a prompt that runs on its own schedule in the Scheduled project."
+                        >
+                          <props.ctx.ui.Button size="small" icon="plus" onClick={() => startCreate()}>
+                            New task
+                          </props.ctx.ui.Button>
+                        </EmptyState>
                       </Show>
-                    </div>
+                    }
+                  >
+                    <EmptyState
+                      title="No tasks for this session"
+                      description="Schedule a prompt to run in this chat."
+                    >
+                      <props.ctx.ui.Button size="small" icon="plus" onClick={() => startCreate()}>
+                        New task
+                      </props.ctx.ui.Button>
+                    </EmptyState>
                   </Show>
-                }
-              >
-                <div style={{ display: "flex", "justify-content": "center", padding: "24px" }}>
-                  <props.ctx.ui.Loader size="normal" />
-                </div>
-              </Show>
-            }
-          >
-            {(row) => (
-              <div style={{ padding: "4px 4px 10px" }}>
-                <Detail
-                  ctx={props.ctx}
-                  monitor={props.monitor}
-                  row={row()}
-                  compact
-                  onBack={() => setSelected(undefined)}
-                  onEdit={() => startCreate(row())}
-                  onDuplicate={() => startCreate(undefined, row())}
-                />
+                </Show>
+              }
+            >
+              <div style={{ display: "flex", "justify-content": "center", padding: "24px" }}>
+                <props.ctx.ui.Loader size="normal" />
               </div>
-            )}
-          </Show>
-        </div>
+            </Show>
+          </div>
+        </Show>
+
+        <Show when={selectedRow()}>
+          {(row) => (
+            <Detail
+              ctx={props.ctx}
+              monitor={props.monitor}
+              row={row()}
+              onBack={() => setSelected(undefined)}
+              onEdit={() => startCreate(row())}
+              onDuplicate={() => startCreate(undefined, row())}
+            />
+          )}
+        </Show>
       </Show>
 
       <Show when={mode() === "create"}>
-        <div style={{ flex: 1, "min-height": 0, "overflow-y": "auto", padding: "10px 12px 12px" }}>
-          <Show when={mode() === "create" ? formNonce() : false} keyed={true}>
-            {(((nonce: number) => (
-              <ScheduledForm
-                ctx={props.ctx}
-                monitor={props.monitor}
-                row={editing()}
-                clone={clone()}
-                initialPrompt={bootPrompt()}
-                targetSession={bootSession()}
-                embedded
-                onCancel={() => {
-                  setEditing(undefined)
-                  setClone(undefined)
-                  setMode("list")
-                }}
-                onDone={done}
-                onOpenExisting={openExisting}
-              />
-            )) as any)}
-          </Show>
-        </div>
+        <Show when={mode() === "create" ? formNonce() : false} keyed={true}>
+          {(((nonce: number) => (
+            <ScheduledForm
+              ctx={props.ctx}
+              monitor={props.monitor}
+              row={editing()}
+              clone={clone()}
+              initialPrompt={bootPrompt()}
+              targetSession={bootSession()}
+              preferCurrent={preferCurrent()}
+              embedded
+              onCancel={() => {
+                setEditing(undefined)
+                setClone(undefined)
+                setMode("list")
+              }}
+              onDone={done}
+              onOpenExisting={openExisting}
+            />
+          )) as any)}
+        </Show>
       </Show>
     </div>
   )
@@ -2025,43 +2315,39 @@ function ScheduledDialog(props: {
     <div style={{ display: "flex", "flex-direction": "column", gap: "12px", "min-height": 0 }}>
       <Styles />
       <Show when={props.monitor.error()}>
-        <div style={{ color: danger, "font-size": "12px", "font-weight": 440, "line-height": "18px", background: `color-mix(in srgb, ${danger} 8%, transparent)`, border: `0.5px solid ${danger}`, "border-radius": "var(--radius-md, 6px)", padding: "8px 10px" }}>
+        <ErrorNotice ctx={props.ctx}>
           {props.monitor.error()}
           <Show when={props.monitor.error()?.toLowerCase().includes("disabled")}>
             <div style={{ color: muted, "margin-top": "5px" }}>
               Add <code>{"experimental.automations: true"}</code> to the OpenCode config, then reload.
             </div>
           </Show>
-        </div>
+        </ErrorNotice>
       </Show>
 
       <Show when={mode() === "list"}>
-        <div style={{ display: "flex", gap: "8px", "align-items": "center", "flex-wrap": "wrap" }}>
-          <div
-            style={{
-              display: "flex",
-              "align-items": "center",
-              gap: "6px",
-              height: "32px",
-              "border-bottom": `1px solid ${border}`,
-            }}
-          >
-            <FilterButton active={filter() === "all"} label="All" count={counts().all} onClick={() => setFilter("all")} />
-            <FilterButton active={filter() === "active"} label="Active" count={counts().active} onClick={() => setFilter("active")} />
-            <FilterButton active={filter() === "paused"} label="Paused" count={counts().paused} onClick={() => setFilter("paused")} />
-            <FilterButton active={filter() === "done"} label="Done" count={counts().done} onClick={() => setFilter("done")} />
+        <TabStrip
+          tabs={[
+            { id: "all", label: "All", count: counts().all },
+            { id: "active", label: "Active", count: counts().active },
+            { id: "paused", label: "Paused", count: counts().paused },
+            { id: "done", label: "Done", count: counts().done },
+          ]}
+          active={filter()}
+          onChange={(id) => setFilter(id as Filter)}
+        />
+
+        <div style={{ display: "flex", gap: "8px", "align-items": "center" }}>
+          <div style={{ flex: 1, "min-width": 0 }}>
+            <props.ctx.ui.TextInput class="sched-field" label="Search" value={query()} onInput={setQuery} placeholder="Search tasks" />
           </div>
-          <div style={{ flex: 1 }} />
-          <div style={{ width: "220px" }}>
-            <props.ctx.ui.TextInput label="Search" value={query()} onInput={setQuery} placeholder="Search tasks" />
-          </div>
-          <props.ctx.ui.Button variant="contrast" icon="plus" onClick={() => startCreate()}>
-            New
+          <props.ctx.ui.Button size="small" icon="plus" onClick={() => startCreate()}>
+            New task
           </props.ctx.ui.Button>
         </div>
 
-        <div style={{ display: "flex", gap: "14px", "min-height": 0, height: "60vh" }}>
-          <div style={{ width: "320px", "flex-shrink": 0, display: "flex", "flex-direction": "column", "min-height": 0, border: `0.5px solid ${border}`, "border-radius": "var(--radius-lg, 8px)", background: base, overflow: "hidden" }}>
+        <div style={{ display: "flex", gap: "12px", "min-height": 0, height: "60vh" }}>
+          <div style={{ width: "300px", "flex-shrink": 0, display: "flex", "flex-direction": "column", "min-height": 0, border: `0.5px solid ${border}`, "border-radius": "var(--radius-lg, 8px)", background: base, overflow: "hidden" }}>
             <div style={{ "overflow-y": "auto", flex: 1, padding: "6px" }}>
               <Show when={props.monitor.loading() && props.monitor.rows().length === 0}>
                 <div style={{ display: "flex", "justify-content": "center", padding: "24px" }}>
@@ -2069,11 +2355,14 @@ function ScheduledDialog(props: {
                 </div>
               </Show>
               <Show when={!props.monitor.loading() && filtered().length === 0}>
-                <div style={{ color: muted, "font-size": "13px", "font-weight": 440, padding: "18px 10px", "line-height": "20px" }}>
-                  {props.monitor.rows().length === 0
-                    ? "No scheduled tasks yet. Create one in the Scheduled project."
-                    : "Nothing matches this filter."}
-                </div>
+                <EmptyState
+                  title={props.monitor.rows().length === 0 ? "No scheduled tasks yet" : "Nothing matches this filter"}
+                  description={
+                    props.monitor.rows().length === 0
+                      ? "Create one in the Scheduled project."
+                      : "Try another filter or clear the search."
+                  }
+                />
               </Show>
               <For each={filtered()}>
                 {(row) => (
@@ -2089,8 +2378,11 @@ function ScheduledDialog(props: {
             </div>
           </div>
 
-          <div style={{ flex: 1, "min-width": 0, "overflow-y": "auto", border: `0.5px solid ${border}`, "border-radius": "var(--radius-lg, 8px)", background: base, padding: "16px" }}>
-            <Show when={selectedRow()} fallback={<div style={{ color: muted, "font-size": "13px", "font-weight": 440 }}>Select a scheduled task.</div>}>
+          <div style={{ flex: 1, "min-width": 0, "min-height": 0, display: "flex", "flex-direction": "column", overflow: "hidden", border: `0.5px solid ${border}`, "border-radius": "var(--radius-lg, 8px)", background: base }}>
+            <Show
+              when={selectedRow()}
+              fallback={<EmptyState title="No task selected" description="Select a scheduled task from the list." />}
+            >
               {(row) => (
                 <Detail
                   ctx={props.ctx}
@@ -2107,25 +2399,27 @@ function ScheduledDialog(props: {
       </Show>
 
       <Show when={mode() === "create"}>
-        <Show when={mode() === "create" ? formNonce() : false} keyed={true}>
-          {(((nonce: number) => (
-            <ScheduledForm
-              ctx={props.ctx}
-              monitor={props.monitor}
-              row={editing()}
-              clone={clone()}
-              initialPrompt={bootPrompt()}
-              targetSession={bootSession()}
-              onCancel={() => {
-                setEditing(undefined)
-                setClone(undefined)
-                setMode("list")
-              }}
-              onDone={done}
-              onOpenExisting={openExisting}
-            />
-          )) as any)}
-        </Show>
+        <div style={{ display: "flex", "flex-direction": "column", height: "60vh", "min-height": 0 }}>
+          <Show when={mode() === "create" ? formNonce() : false} keyed={true}>
+            {(((nonce: number) => (
+              <ScheduledForm
+                ctx={props.ctx}
+                monitor={props.monitor}
+                row={editing()}
+                clone={clone()}
+                initialPrompt={bootPrompt()}
+                targetSession={bootSession()}
+                onCancel={() => {
+                  setEditing(undefined)
+                  setClone(undefined)
+                  setMode("list")
+                }}
+                onDone={done}
+                onOpenExisting={openExisting}
+              />
+            )) as any)}
+          </Show>
+        </div>
       </Show>
     </div>
   )
@@ -2197,10 +2491,11 @@ const setup: Plugin.Setup<typeof definition> = (ctx) => {
     width: 560,
     mobile: { title: "Scheduled", order: 45, kind: "menu", icon: "status" },
     list: (input: any) => (input.open.includes("main") ? [panelTab] : []),
-    render: () => (
+    render: (panelProps) => (
       <ScheduledPanel
         ctx={ctx}
         monitor={monitor}
+        session={() => panelProps.session}
         requested={createRequest}
         onConsume={() => setCreateRequest((current) => ({ ...current, consumed: true }))}
       />
